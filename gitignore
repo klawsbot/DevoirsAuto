@@ -1,0 +1,17 @@
+# Credentials - JAMAIS sur GitHub
+.env
+
+# Données locales
+data/
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
