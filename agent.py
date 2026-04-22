@@ -5,6 +5,7 @@ Scrape MyCourses, rédige les devoirs avec Claude API, notifie via Telegram.
 
 import os
 import json
+import time
 import argparse
 import logging
 import asyncio
@@ -19,12 +20,13 @@ Path("logs").mkdir(exist_ok=True)
 Path("data/assignments").mkdir(parents=True, exist_ok=True)
 Path("data/courses").mkdir(parents=True, exist_ok=True)
 Path("data/drafts").mkdir(parents=True, exist_ok=True)
+Path("data/session").mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("logs/agent.log"),
+        logging.FileHandler("logs/agent.log", encoding="utf-8"),
         logging.StreamHandler()
     ]
 )
@@ -41,6 +43,97 @@ ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+SESSION_FILE = "data/session/state.json"
+SESSION_MAX_AGE = 8 * 3600  # 8 heures
+
+# ─────────────────────────────────────────────
+# GESTION SESSION
+# ─────────────────────────────────────────────
+
+async def authenticate_and_save_session():
+    """Ouvre le navigateur visible pour auth MFA manuelle. Sauvegarde la session ensuite."""
+    from playwright.async_api import async_playwright
+    print("\n[AUTH] Ouverture du navigateur...")
+    print("[AUTH] Le formulaire sera pre-rempli. Complete le MFA quand demande.")
+    print("[AUTH] Le navigateur se fermera automatiquement apres connexion.\n")
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False, slow_mo=300)
+        context = await browser.new_context()
+        page = await context.new_page()
+
+        await page.goto(f"{MOODLE_URL}/login/index.php")
+        await page.wait_for_load_state("domcontentloaded")
+        await page.click(".ing-connexion-sso")
+        await page.locator("input[name='loginfmt']").wait_for(state="visible", timeout=15000)
+        await page.fill("input[name='loginfmt']", MOODLE_USER)
+        await page.click("input[type='submit']")
+        await page.locator("input[name='passwd']").wait_for(state="visible", timeout=15000)
+        await page.fill("input[name='passwd']", MOODLE_PASS)
+        await page.click("input[type='submit']")
+
+        print("[AUTH] Mot de passe soumis. Complete le MFA sur l'authenticator (max 3 min)...")
+        await page.wait_for_url(f"{MOODLE_URL}/**", timeout=180000)
+        await page.wait_for_load_state("networkidle")
+
+        Path(SESSION_FILE).parent.mkdir(parents=True, exist_ok=True)
+        await context.storage_state(path=SESSION_FILE)
+        print(f"[AUTH] Session sauvegardee -> {SESSION_FILE}")
+        print("[AUTH] Tu peux maintenant lancer : python agent.py fetch")
+        await browser.close()
+
+
+async def get_authenticated_page(p):
+    """Retourne (browser, context, page) avec session Moodle active.
+    Réutilise la session sauvegardée si valide, sinon lance le navigateur
+    visible pour que l'utilisateur complète le MFA une fois."""
+
+    # Tenter de réutiliser la session sauvegardée
+    if Path(SESSION_FILE).exists():
+        age = time.time() - Path(SESSION_FILE).stat().st_mtime
+        if age < SESSION_MAX_AGE:
+            try:
+                browser = await p.chromium.launch(headless=True)
+                context = await browser.new_context(storage_state=SESSION_FILE)
+                page = await context.new_page()
+                await page.goto(f"{MOODLE_URL}/my/")
+                await page.wait_for_load_state("networkidle")
+                if "mycourses.ieseg.fr" in page.url:
+                    log.info("Session reutilisee depuis le cache.")
+                    return browser, context, page
+                await browser.close()
+                log.info("Session expiree, re-authentification...")
+            except Exception as e:
+                log.warning(f"Echec chargement session : {e}")
+
+    # Authentification complète avec MFA (browser visible)
+    log.info("Ouverture navigateur pour authentification MFA...")
+    log.info("Complete le MFA dans le navigateur, puis attends...")
+    browser = await p.chromium.launch(headless=False, slow_mo=200)
+    context = await browser.new_context()
+    page = await context.new_page()
+
+    await page.goto(f"{MOODLE_URL}/login/index.php")
+    await page.wait_for_load_state("domcontentloaded")
+    await page.click(".ing-connexion-sso")
+    await page.locator("input[name='loginfmt']").wait_for(state="visible", timeout=15000)
+    await page.fill("input[name='loginfmt']", MOODLE_USER)
+    await page.click("input[type='submit']")
+    await page.locator("input[name='passwd']").wait_for(state="visible", timeout=15000)
+    await page.fill("input[name='passwd']", MOODLE_PASS)
+    await page.click("input[type='submit']")
+
+    # Attendre que l'utilisateur complète le MFA et soit redirigé sur Moodle
+    log.info("En attente du MFA (max 2 minutes)...")
+    await page.wait_for_url(f"{MOODLE_URL}/**", timeout=120000)
+    await page.wait_for_load_state("networkidle")
+
+    # Sauvegarder la session
+    await context.storage_state(path=SESSION_FILE)
+    log.info("Session sauvegardee.")
+    return browser, context, page
+
+
 # ─────────────────────────────────────────────
 # SCRAPING MOODLE
 # ─────────────────────────────────────────────
@@ -49,77 +142,81 @@ async def fetch_assignments():
     """Se connecte à MyCourses et récupère tous les devoirs en cours."""
     from playwright.async_api import async_playwright
 
-    log.info("Connexion à MyCourses...")
+    log.info("Connexion a MyCourses...")
     assignments = []
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
-        page = await context.new_page()
+        browser, context, page = await get_authenticated_page(p)
 
-        # Connexion
-        await page.goto(f"{MOODLE_URL}/login/index.php")
-        await page.fill("#username", MOODLE_USER)
-        await page.fill("#password", MOODLE_PASS)
-        await page.click("#loginbtn")
-        await page.wait_for_load_state("networkidle")
+        log.info("Connecte. Recuperation des devoirs...")
 
-        log.info("Connecté. Récupération des devoirs...")
-
-        # Aller sur la page des devoirs à rendre
         await page.goto(f"{MOODLE_URL}/my/")
         await page.wait_for_load_state("networkidle")
 
-        # Récupérer le bloc "À rendre"
-        # Moodle affiche les devoirs dans le timeline block
-        try:
-            await page.wait_for_selector(".block_timeline", timeout=5000)
-            items = await page.query_selector_all(".event-list-item")
+        sesskey = await page.evaluate("M.cfg.sesskey")
+        items = await page.query_selector_all("div[data-region='event-item']")
+        log.info(f"{len(items)} evenement(s) trouve(s) dans le bloc upcoming.")
 
-            for item in items:
-                try:
-                    title_el = await item.query_selector(".event-name")
-                    course_el = await item.query_selector(".course-name")
-                    date_el = await item.query_selector(".date-column")
-                    link_el = await item.query_selector("a")
-
-                    title = await title_el.inner_text() if title_el else "Sans titre"
-                    course = await course_el.inner_text() if course_el else "Cours inconnu"
-                    due_date = await date_el.inner_text() if date_el else "Date inconnue"
-                    link = await link_el.get_attribute("href") if link_el else ""
-
-                    assignment = {
-                        "id": len(assignments) + 1,
-                        "title": title.strip(),
-                        "course": course.strip(),
-                        "due_date": due_date.strip(),
-                        "url": link,
-                        "status": "pending",
-                        "fetched_at": datetime.now().isoformat()
-                    }
-
-                    # Aller chercher la consigne détaillée
-                    if link:
-                        await page.goto(link)
-                        await page.wait_for_load_state("networkidle")
-
-                        intro_el = await page.query_selector(".box.py-3")
-                        if intro_el:
-                            assignment["instructions"] = await intro_el.inner_text()
-                        else:
-                            assignment["instructions"] = "Consigne non trouvée, vérifier manuellement."
-
-                    assignments.append(assignment)
-                    log.info(f"  ✓ Devoir trouvé : {title}")
-
-                except Exception as e:
-                    log.warning(f"Erreur sur un devoir : {e}")
+        # Passe 1 : collecter event_ids et titres sans naviguer
+        raw_events = []
+        for item in items:
+            try:
+                link_el = await item.query_selector("a[data-action='view-event']")
+                date_el = await item.query_selector(".date")
+                if not link_el:
                     continue
+                raw_events.append({
+                    "title": (await link_el.inner_text()).strip(),
+                    "event_id": await link_el.get_attribute("data-event-id"),
+                    "due_date": (await date_el.inner_text()).strip() if date_el else "Date inconnue",
+                })
+            except Exception as e:
+                log.warning(f"Erreur lecture item : {e}")
 
-        except Exception as e:
-            log.warning(f"Bloc timeline non trouvé, tentative méthode alternative... ({e})")
-            # Méthode alternative : chercher via les cours
-            assignments = await fetch_from_courses(page)
+        # Passe 2 : AJAX + navigation par event
+        for ev in raw_events:
+            try:
+                event_id = ev["event_id"]
+                resp = await page.evaluate(f"""
+                    fetch('/lib/ajax/service.php?sesskey={sesskey}', {{
+                        method: 'POST',
+                        headers: {{'Content-Type': 'application/json'}},
+                        body: JSON.stringify([{{"index":0,"methodname":"core_calendar_get_calendar_event_by_id","args":{{"eventid":{event_id}}}}}])
+                    }}).then(r => r.json())
+                """)
+                event_data = resp[0].get("data", {}).get("event", {}) if not resp[0].get("error") else {}
+                instance = event_data.get("instance")
+                course_name = event_data.get("course", {}).get("fullname", "Cours inconnu")
+                assign_url = f"{MOODLE_URL}/mod/assign/view.php?id={instance}" if instance else ""
+
+                assignment = {
+                    "id": len(assignments) + 1,
+                    "title": ev["title"],
+                    "course": course_name,
+                    "due_date": ev["due_date"],
+                    "url": assign_url,
+                    "event_id": event_id,
+                    "status": "pending",
+                    "fetched_at": datetime.now().isoformat()
+                }
+
+                if assign_url:
+                    await page.goto(assign_url)
+                    await page.wait_for_load_state("networkidle")
+                    instructions = "Consigne non trouvee, verifier manuellement."
+                    for sel in [".box.py-3", "#intro", ".activity-description", ".assignmentintro"]:
+                        intro_el = await page.query_selector(sel)
+                        if intro_el:
+                            instructions = (await intro_el.inner_text()).strip()
+                            break
+                    assignment["instructions"] = instructions
+
+                assignments.append(assignment)
+                log.info(f"  Devoir : {ev['title']} | {course_name} | {ev['due_date']}")
+
+            except Exception as e:
+                log.warning(f"Erreur evenement {ev.get('event_id')} : {e}")
+                continue
 
         await browser.close()
 
@@ -385,15 +482,7 @@ async def submit_assignment(assignment_id: int):
     log.info(f"Soumission du devoir : {assignment['title']}")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-
-        # Connexion
-        await page.goto(f"{MOODLE_URL}/login/index.php")
-        await page.fill("#username", MOODLE_USER)
-        await page.fill("#password", MOODLE_PASS)
-        await page.click("#loginbtn")
-        await page.wait_for_load_state("networkidle")
+        browser, context, page = await get_authenticated_page(p)
 
         # Aller sur le devoir
         await page.goto(assignment["url"])
@@ -512,6 +601,7 @@ def main():
     parser = argparse.ArgumentParser(description="Agent Devoirs IESEG")
     subparsers = parser.add_subparsers(dest="command")
 
+    subparsers.add_parser("auth", help="Authentification MFA (à faire une fois, browser visible)")
     subparsers.add_parser("fetch", help="Récupère les devoirs depuis MyCourses")
 
     write_p = subparsers.add_parser("write", help="Rédige un devoir")
@@ -528,7 +618,10 @@ def main():
 
     args = parser.parse_args()
 
-    if args.command == "fetch":
+    if args.command == "auth":
+        asyncio.run(authenticate_and_save_session())
+
+    elif args.command == "fetch":
         asyncio.run(fetch_assignments())
 
     elif args.command == "write":
